@@ -19,6 +19,11 @@ from .anonymizer import (
 )
 from .geo import MAX_ZOOM_LIMIT, assign_cells, prepare_points
 from .intersection import audit_intersections
+from .time_anonymize import (
+    MAX_WINDOW_HOURS_LIMIT,
+    MIN_WINDOW_HOURS_LIMIT,
+    anonymize_times,
+)
 
 API_PREFIX = "/api/v1"
 
@@ -32,8 +37,10 @@ app = FastAPI(
         "分组按 id 求交集，标记成员数不足 k 的交集。"
         "另提供坐标自适应网格匿名化：以全球经纬范围为根格递归四分，"
         "仅当每个非空子格都至少有 k 条记录时才拆分，输出可发布的 z/x/y 格。"
+        "另提供时间匿名化：把同一 UTC 日期内带时区的观测时刻归槽为 UTC 小时，"
+        "全局最优地切分为每窗至少 k 条、跨度受限的连续小时窗口。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -161,6 +168,48 @@ class GeoAnonymizeResponse(BaseModel):
     total_records: int
 
 
+class TimeAnonymizeRequest(BaseModel):
+    """时间匿名化请求体。"""
+
+    # 拒绝 bool 冒充整数；k 必须为正整数。
+    k: StrictInt = Field(..., description="每个发布时间窗口至少包含的记录数")
+    # 拒绝 bool 冒充整数；允许 1～24 小时。
+    max_window_hours: StrictInt = Field(
+        ..., description="单个窗口首末有记录小时的最大覆盖跨度（1～24 小时）"
+    )
+    records: list[dict[str, Any]] = Field(
+        ..., description="同一 UTC 日期内含唯一 id、带时区 observed_at 的观测记录"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TimeAssignment(BaseModel):
+    """一条记录所属的发布窗口（仅 id 与半开 UTC 小时区间，不回传原时刻）。"""
+
+    id: str
+    window_start: str
+    window_end: str
+
+
+class TimeWindow(BaseModel):
+    """一个发布窗口：半开 UTC 小时区间 [window_start, window_end) 与人数。"""
+
+    start: str
+    end: str
+    count: int
+
+
+class TimeAnonymizeResponse(BaseModel):
+    """时间匿名化结果。"""
+
+    records: list[TimeAssignment]
+    windows: list[TimeWindow]
+    k: int
+    max_window_hours: int
+    total_records: int
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     """服务信息。"""
@@ -171,6 +220,7 @@ def root() -> dict[str, str]:
         "anonymize": f"{API_PREFIX}/anonymize",
         "audit_intersection": f"{API_PREFIX}/audit-intersection",
         "geo_anonymize": f"{API_PREFIX}/geo-anonymize",
+        "time_anonymize": f"{API_PREFIX}/time-anonymize",
     }
 
 
@@ -276,5 +326,39 @@ def geo_anonymize(request: GeoAnonymizeRequest) -> GeoAnonymizeResponse:
         cells=[GeoCell(**cell) for cell in cells],
         k=request.k,
         max_zoom=request.max_zoom,
+        total_records=len(request.records),
+    )
+
+
+@app.post(
+    f"{API_PREFIX}/time-anonymize",
+    response_model=TimeAnonymizeResponse,
+)
+def time_anonymize(request: TimeAnonymizeRequest) -> TimeAnonymizeResponse:
+    """把带时区观测时刻归槽为 UTC 小时并切分为连续窗口：返回各 id 的发布窗口。"""
+    if request.k < 1:
+        raise unprocessable("k 必须是正整数（>= 1）")
+
+    if not MIN_WINDOW_HOURS_LIMIT <= request.max_window_hours <= MAX_WINDOW_HOURS_LIMIT:
+        raise unprocessable(
+            f"max_window_hours 必须是 {MIN_WINDOW_HOURS_LIMIT} 到 "
+            f"{MAX_WINDOW_HOURS_LIMIT} 之间的整数"
+        )
+
+    # 记录总数小于 k：任何划分都至少有一个窗口，不可能全部达到 k 条。
+    if len(request.records) < request.k:
+        raise unprocessable(
+            f"记录总数 {len(request.records)} 小于 k={request.k}，无法满足 k-匿名"
+        )
+
+    record_results, window_results = anonymize_times(
+        request.records, request.k, request.max_window_hours
+    )
+
+    return TimeAnonymizeResponse(
+        records=[TimeAssignment(**item) for item in record_results],
+        windows=[TimeWindow(**item) for item in window_results],
+        k=request.k,
+        max_window_hours=request.max_window_hours,
         total_records=len(request.records),
     )

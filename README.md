@@ -9,6 +9,9 @@
 此外，服务还提供**坐标自适应网格匿名化**：以全球经纬范围为根格递归四分，
 仅当每个非空子格都至少有 **k** 条记录时才拆分，输出可发布的 `z/x/y` 网格，
 替代直接公开精确坐标。
+以及**时间匿名化**：把带时区的观测时刻统一换算为 UTC 并按小时归槽，
+在“每窗至少 k 条、首末小时覆盖跨度受限、同小时记录不拆开”的约束下做
+全局最优的连续窗口划分，只发布半开 UTC 小时区间，替代直接公开精确时刻。
 
 服务为纯内存、无状态处理：**原始记录不写日志、不落盘、不挂载数据卷**。
 
@@ -24,6 +27,7 @@ docker compose up --build
 - 匿名化接口：`POST http://localhost:8000/api/v1/anonymize`
 - 两次发布关联风险审计接口：`POST http://localhost:8000/api/v1/audit-intersection`
 - 坐标自适应网格匿名化接口：`POST http://localhost:8000/api/v1/geo-anonymize`
+- 时间匿名化接口：`POST http://localhost:8000/api/v1/time-anonymize`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -355,6 +359,101 @@ curl -s http://localhost:8000/api/v1/geo-anonymize \
 - 某条记录缺少 `latitude`/`longitude`，或值不是有限数值
   （含字符串、布尔值、`NaN`、无穷）；
 - 坐标越界：纬度超出 -90～90 或经度超出 -180～180；
+- 请求体缺少必填字段或出现未声明字段。
+
+## 时间匿名化
+
+`POST /api/v1/time-anonymize`，`Content-Type: application/json`。
+
+直接发布精确观测时刻会暴露巡护路线与物种活动节律。本接口把每条记录的
+`observed_at` **统一换算为 UTC** 并按整点向下归槽（分钟、秒截断），只保留
+有记录的小时，再把这些小时按时间顺序切分为互不重叠的**连续窗口**后发布：
+
+1. 每个窗口至少包含 `k` 条记录；
+2. 窗口内首个与末个有记录小时的**覆盖跨度**（半开区间
+   `[start, end)` 的小时数，含中间没有记录的空档小时）不超过
+   `max_window_hours`（1～24）；
+3. **同一小时桶内的记录必须整体进入同一个窗口，不能拆开**。
+
+在所有可行划分中，最小化各窗 **记录数 × 跨度小时** 之和；总和相同时，
+按**各窗口结束小时序列的字典序**选最早者。全部记录换算到 UTC 后必须落在
+**同一个 UTC 日期**内（窗口不会跨 UTC 日期）。
+
+### 请求格式
+
+```json
+{
+  "k": 3,
+  "max_window_hours": 4,
+  "records": [
+    {"id": "obs-001", "observed_at": "2026-09-25T08:12:00+08:00", "species": "金丝猴"},
+    {"id": "obs-002", "observed_at": "2026-09-25T09:03:00[Asia/Shanghai]"},
+    {"id": "obs-003", "observed_at": "2026-09-25T02:47:00+00:00"}
+  ]
+}
+```
+
+- `k`：正整数，每个发布窗口至少包含的记录数。
+- `max_window_hours`：1～24 的整数，单窗首末有记录小时的最大覆盖跨度。
+- `records`：观测记录数组，每条必须包含：
+  - `id`：**非空字符串**，且在整批记录中**唯一**；
+  - `observed_at`：**带时区**的 ISO 8601 时间字符串，支持 UTC 偏移量
+    （如 `Z`、`+08:00`）与方括号包裹的 IANA 时区名
+    （如 `2026-09-25T08:00:00[Asia/Shanghai]`）；不接受无时区的本地时间；
+  - 其余字段（如 `species`）不参与处理，也**不会**在响应中回传。
+
+### 响应格式
+
+上例中三条记录换算为 UTC 后分别落在 0、1、2 点（北京时间 8/9 点与 UTC 2:47
+同档），`k=3` 时必须并入同一窗 `[00:00, 03:00)`：
+
+```json
+{
+  "records": [
+    {"id": "obs-001", "window_start": "2026-09-25T00:00:00Z", "window_end": "2026-09-25T03:00:00Z"},
+    {"id": "obs-002", "window_start": "2026-09-25T00:00:00Z", "window_end": "2026-09-25T03:00:00Z"},
+    {"id": "obs-003", "window_start": "2026-09-25T00:00:00Z", "window_end": "2026-09-25T03:00:00Z"}
+  ],
+  "windows": [
+    {"start": "2026-09-25T00:00:00Z", "end": "2026-09-25T03:00:00Z", "count": 3}
+  ],
+  "k": 3,
+  "max_window_hours": 4,
+  "total_records": 3
+}
+```
+
+- `records`：与输入**等长、等序**，每项只含 `id` 与所属窗口的
+  `window_start` / `window_end`；**不回传原时刻或其他原字段**。
+- `windows`：各发布窗口，按时间升序；`start`/`end` 为整点时刻，构成
+  **半开 UTC 小时区间 `[window_start, window_end)`**，即该窗覆盖从
+  `start`（含）到 `end`（不含）的所有小时；跨到次日 0 点时右端为
+  `YYYY-MM-DDT00:00:00Z`（如下例 `2026-09-26T00:00:00Z`）。`count`
+  为窗内记录数，均 `>= k`。
+
+仓库内 `examples/request-time-anonymize.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/time-anonymize \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-time-anonymize.json
+```
+
+### 时间接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- `k` 不是正整数（含 `0`、负数、布尔值、非整数）；
+- `max_window_hours` 不是 1～24 的整数（含 `0`、负数、超过 24、布尔值、非整数）；
+- 记录总数小于 `k`（含空记录数组）；
+- 某条记录缺少 id、id 不是非空字符串，或 id 在批内重复；
+- 某条记录缺少 `observed_at`、不是字符串、无法解析为 ISO 8601 时刻，
+  或**不带时区**（不接受无时区的本地时间）；
+- IANA 时区名无法识别（镜像内置 `tzdata` 时区库）；
+- 记录换算到 UTC 后不落在**同一个 UTC 日期**（错误信息列出冲突日期）；
+- **不存在可行划分**：例如某不足 k 条的小时桶只能与远处小时合并，
+  而合并后首末有记录小时的覆盖跨度超过 `max_window_hours`；
 - 请求体缺少必填字段或出现未声明字段。
 
 ## 422 校验错误
