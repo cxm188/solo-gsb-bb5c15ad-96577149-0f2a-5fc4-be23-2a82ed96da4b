@@ -9,6 +9,10 @@
 此外，服务还提供**坐标自适应网格匿名化**：以全球经纬范围为根格递归四分，
 仅当每个非空子格都至少有 **k** 条记录时才拆分，输出可发布的 `z/x/y` 网格，
 替代直接公开精确坐标。
+以及**观测时间窗口匿名化**：把同一 UTC 日期内的观测时间按小时归槽后划分为
+连续时间窗，每窗至少 **k** 条且首末小时跨度不超过上限，全局最优最小化各窗
+“记录数 × 跨度小时”之和，输出各 id 所属的半开 UTC 小时区间，替代直接公开
+精确观测时刻。
 
 服务为纯内存、无状态处理：**原始记录不写日志、不落盘、不挂载数据卷**。
 
@@ -24,6 +28,7 @@ docker compose up --build
 - 匿名化接口：`POST http://localhost:8000/api/v1/anonymize`
 - 两次发布关联风险审计接口：`POST http://localhost:8000/api/v1/audit-intersection`
 - 坐标自适应网格匿名化接口：`POST http://localhost:8000/api/v1/geo-anonymize`
+- 观测时间窗口匿名化接口：`POST http://localhost:8000/api/v1/time-anonymize`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -355,6 +360,103 @@ curl -s http://localhost:8000/api/v1/geo-anonymize \
 - 某条记录缺少 `latitude`/`longitude`，或值不是有限数值
   （含字符串、布尔值、`NaN`、无穷）；
 - 坐标越界：纬度超出 -90～90 或经度超出 -180～180；
+- 请求体缺少必填字段或出现未声明字段。
+
+## 观测时间窗口匿名化
+
+`POST /api/v1/time-anonymize`，`Content-Type: application/json`。
+
+直接发布精确观测时刻会暴露物种的活动节律。本接口把**同一 UTC 日期**内的
+观测时间归入**连续小时窗口**后再发布：所有记录先按各自时区转换到 UTC 并
+按小时归槽，有记录的小时槽按时间升序划分为连续窗口——**每个窗口至少包含
+k 条记录、首末小时覆盖的跨度（末小时 − 首小时 + 1 小时）不超过
+`max_window_hours`，且同一小时槽内的记录不可拆分到不同窗口**。在所有可行
+划分中取**全局最优**：最小化各窗口“记录数 × 跨度小时”之和；代价相同时，
+按**窗口结束小时序列的字典序**选最早者。
+
+### 请求格式
+
+```json
+{
+  "k": 2,
+  "max_window_hours": 4,
+  "records": [
+    {"id": "obs-001", "observed_at": "2026-03-15T08:12:00+00:00", "species": "金丝猴"},
+    {"id": "obs-002", "observed_at": "2026-03-15T08:45:00+00:00", "species": "金丝猴"},
+    {"id": "obs-003", "observed_at": "2026-03-15T09:05:00+00:00", "species": "林麝"},
+    {"id": "obs-004", "observed_at": "2026-03-15T09:30:00+00:00", "species": "林麝"},
+    {"id": "obs-005", "observed_at": "2026-03-15T16:20:00+08:00", "species": "云豹"},
+    {"id": "obs-006", "observed_at": "2026-03-15T16:50:00+08:00", "species": "云豹"}
+  ]
+}
+```
+
+- `k`：正整数，每个时间窗口至少包含的记录数。
+- `max_window_hours`：1～24 的整数，单个窗口首末小时覆盖的最大跨度小时数
+  （`1` 表示每个窗口只覆盖一个小时槽）。
+- `records`：观测记录数组，每条必须包含：
+  - `id`：**非空字符串**，且在整批记录中**唯一**；
+  - `observed_at`：**带时区信息**的 ISO 8601 字符串（如
+    `2026-03-15T08:12:00+00:00` 或 `2026-03-15T16:20:00+08:00`，`Z` 后缀
+    同样接受）；不带时区的日期时间（如 `2026-03-15T08:12:00`）会被拒绝；
+  - 全部记录转换到 UTC 后必须落在**同一 UTC 日历日期**（本地日期可以不同）；
+  - 其余字段（如 `species`）不参与处理，也**不会**在响应中回传。
+
+### 响应格式
+
+上例中 `obs-005`/`obs-006` 的本地时刻 `16:20+08:00`、`16:50+08:00` 转换到
+UTC 后为 `08:20`、`08:50`，因此 UTC 08 时共 4 条、09 时共 2 条；k=2 时每个
+小时槽单独成窗即最优（总代价 `4×1 + 2×1 = 6`）：
+
+```json
+{
+  "records": [
+    {"id": "obs-001", "window_start": "2026-03-15T08:00:00Z", "window_end": "2026-03-15T09:00:00Z"},
+    {"id": "obs-002", "window_start": "2026-03-15T08:00:00Z", "window_end": "2026-03-15T09:00:00Z"},
+    {"id": "obs-003", "window_start": "2026-03-15T09:00:00Z", "window_end": "2026-03-15T10:00:00Z"},
+    {"id": "obs-004", "window_start": "2026-03-15T09:00:00Z", "window_end": "2026-03-15T10:00:00Z"},
+    {"id": "obs-005", "window_start": "2026-03-15T08:00:00Z", "window_end": "2026-03-15T09:00:00Z"},
+    {"id": "obs-006", "window_start": "2026-03-15T08:00:00Z", "window_end": "2026-03-15T09:00:00Z"}
+  ],
+  "windows": [
+    {"window_start": "2026-03-15T08:00:00Z", "window_end": "2026-03-15T09:00:00Z", "count": 4},
+    {"window_start": "2026-03-15T09:00:00Z", "window_end": "2026-03-15T10:00:00Z", "count": 2}
+  ],
+  "k": 2,
+  "max_window_hours": 4,
+  "total_records": 6
+}
+```
+
+- `records`：与输入**等长、等序**，每项只含 `id` 与该记录所属窗口的
+  **半开 UTC 小时区间** `[window_start, window_end)`（整点对齐，右端不含；
+  覆盖 23 时的窗口右端为次日 `00:00`）；**不回传原时间或其他原字段**。
+- `windows`：各发布窗口的半开区间与记录数 `count`（均 `>= k`），按时间
+  升序排列；窗口跨度 = `window_end - window_start` 的小时数，均
+  `<= max_window_hours`。
+
+仓库内 `examples/request-time-anonymize.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/time-anonymize \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-time-anonymize.json
+```
+
+### 时间窗口接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- `k` 不是正整数（含 `0`、负数、布尔值、非整数）；
+- `max_window_hours` 不是 1～24 的整数（含 `0`、超过 24、布尔值、非整数）；
+- 记录总数小于 `k`（含空记录数组）；
+- 某条记录缺少 id、id 不是非空字符串，或 id 在批内重复；
+- 某条记录缺少 `observed_at`、不是字符串、无法解析为 ISO 8601 时间，
+  或不携带时区信息；
+- 全部记录转换到 UTC 后不在同一日历日期；
+- 不存在可行划分（某个小时槽记录不足 k 条，而与相邻槽合并又会超出
+  `max_window_hours`）；
 - 请求体缺少必填字段或出现未声明字段。
 
 ## 422 校验错误
